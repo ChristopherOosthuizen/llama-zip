@@ -1,14 +1,19 @@
 import argparse
 import base64
 import codecs
+import json
 import signal
 import sys
 
 import numpy as np
-from llama_cpp import Llama
+import torch
 from more_itertools import consume
 from tqdm import tqdm
-
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedTokenizer,
+)
 
 PUA_START = 0xE000
 
@@ -17,8 +22,54 @@ FREQ_SCALE_FACTOR = 1 << 32
 
 BASE64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 BASE64_EQ = BASE64 + b"="
+class CustomTokenizer(PreTrainedTokenizer):
+    def __init__(self, vocab_file=None, **kwargs):
+        super().__init__(**kwargs)
+        self.vocab = self.get_vocab()
+        self.pad_token = "[PAD]"
+        self.unk_token = "[UNK]"
+        self.eos_token = "[EOS]"
+        self.mask_token = "[MASK]"
+        self.sep_token = "[SEP]"
+        self.bos_token = "[EOS]"  # Set BOS token to EOS
 
+    def _tokenize(self, text):
+        return list(text)  # Tokenize by character
 
+    def _convert_token_to_id(self, token):
+        return self.vocab.get(token, self.vocab[self.unk_token])
+
+    def _convert_id_to_token(self, index):
+        for token, token_id in self.vocab.items():
+            if token_id == index:
+                return token
+        return self.unk_token
+
+    def save_vocabulary(self, save_directory, filename_prefix=None):
+        """Save the tokenizer vocabulary to the specified directory."""
+        vocab_file_path = f"{save_directory}/{filename_prefix or ''}vocab.json"
+        with open(vocab_file_path, "w") as f:
+            json.dump(self.get_vocab(), f)
+        return (vocab_file_path,)
+
+    def get_vocab(self):
+        # Assign indices to special tokens
+        vocab = {
+            "[PAD]": 0,
+            "[UNK]": 1,
+            "[EOS]": 2,
+            "[MASK]": 3,
+            "[SEP]": 4,
+            # Note: We don't define a separate [BOS] token
+            # Since BOS is the same as EOS
+        }
+        # Start character indices after the special tokens
+        start_index = max(vocab.values()) + 1
+        vocab.update({chr(x): idx for idx, x in enumerate(range(32, 127), start=start_index)})
+        return vocab
+
+    def __len__(self):
+        return len(self.vocab)
 class ArithmeticCoderBase:
     def __init__(self):
         full_range = 1 << NUM_STATE_BITS
@@ -251,13 +302,18 @@ class LlamaZip:
         loading_message = "Loading model..."
         if self.verbose:
             print(loading_message, end="", flush=True, file=sys.stderr)
-        self.model = Llama(
-            model_path=model_path,
-            use_mlock=use_mlock,
-            n_gpu_layers=n_gpu_layers,
-            n_ctx=n_ctx,
-            verbose=False,
-        )
+
+        # Use the CustomTokenizer for the specific model
+        if model_path == "christopherOosthuizen/gpt2-small":
+            self.tokenizer = CustomTokenizer()
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path)
+        self.model.eval()
+        # Set max context length if specified
+        if n_ctx > 0:
+            self.model.config.max_position_embeddings = n_ctx
         if self.verbose:
             print(
                 "\r" + " " * len(loading_message) + "\r",
@@ -267,45 +323,35 @@ class LlamaZip:
             )
 
     def compute_cdf(self, logits):
-        logprobs = self.model.logits_to_logprobs(logits)
-        probs = np.exp(logprobs).astype(np.float64)
+        # logits: torch.Tensor of shape (1, vocab_size)
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        probs = torch.exp(logprobs).detach().cpu().numpy()[0]
         freqs = np.maximum(1, np.round(FREQ_SCALE_FACTOR * probs))
         cum_freqs = np.cumsum(freqs)
         return cum_freqs
 
+    def tokenizer_adds_space_prefix(self):
+        space = " "
+        double_space = "  "
+        tokenized = self.tokenizer.encode(space, add_special_tokens=False)
+        detokenized = self.tokenizer.decode(
+            tokenized, clean_up_tokenization_spaces=False
+        )
+        return detokenized == double_space
+
     def compress(self, uncompressed: bytes, window_overlap=0) -> bytes:
-        def sigint_handler(*_):
-            nonlocal interrupted
-            interrupted = True
+        uncompressed_text = bytes_to_utf8(uncompressed).decode("utf-8")
+        tokens = self.tokenizer.encode(uncompressed_text, add_special_tokens=False)
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.sep_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.convert_tokens_to_ids("[EOS]")
+        if eos_token_id is None:
+            raise ValueError("No EOS token found in tokenizer.")
+        tokens.append(eos_token_id)
 
-        def process_logits(_, logits):
-            nonlocal next_token_idx
-            if interrupted and next_token_idx < len(tokens) - 1:
-                next_token_idx = len(tokens) - 1
-                if self.verbose:
-                    print(file=sys.stderr)
-            next_token = tokens[next_token_idx]
-            next_token_idx += 1
-            cdf = self.compute_cdf(logits)
-            token_encoder.encode_symbol(cdf, next_token)
-            progress_bar.update()
-            logits[next_token] = np.inf
-            return logits
-
-        def should_stop(tokens_so_far, logits):
-            return (
-                np.argmax(logits) == self.model.token_eos()
-                or len(tokens_so_far) == self.model.n_ctx()
-            )
-
-        self.model.reset()
-        tokens = self.model.tokenize(bytes_to_utf8(uncompressed), add_bos=False)
-        tokens.append(self.model.token_eos())
-        next_token_idx = 0
         token_encoder = Encoder()
-
-        interrupted = False
-        s = signal.signal(signal.SIGINT, sigint_handler)
 
         progress_bar = tqdm(
             total=len(tokens),
@@ -317,75 +363,116 @@ class LlamaZip:
             disable=not self.verbose,
         )
 
+        interrupted = False
+
+        def sigint_handler(*_):
+            nonlocal interrupted
+            interrupted = True
+
+        s = signal.signal(signal.SIGINT, sigint_handler)
+
+        next_token_idx = 0
+        max_context_length = self.model.config.max_position_embeddings
+
         while next_token_idx < len(tokens):
             start_idx = max(0, next_token_idx - window_overlap)
-            consume(
-                self.model.generate(
-                    tokens=[self.model.token_bos()] + tokens[start_idx:next_token_idx],
-                    temp=0.0,
-                    logits_processor=process_logits,
-                    stopping_criteria=should_stop,
-                )
-            )
-        progress_bar.close()
+            context_tokens = tokens[start_idx:next_token_idx]
+            input_ids = [self.tokenizer.bos_token_id] + context_tokens
+            input_ids = torch.tensor([input_ids])
 
+            if input_ids.size(1) >= max_context_length:
+                # Truncate input_ids if necessary
+                input_ids = input_ids[:, -max_context_length:]
+
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids)
+                logits = outputs.logits[0, -1, :]  # get logits for the next token
+
+            # Compute cdf
+            logits = logits.unsqueeze(0)
+            cdf = self.compute_cdf(logits)
+
+            # Get the next token
+            if interrupted and next_token_idx < len(tokens) - 1:
+                next_token_idx = len(tokens) - 1
+                if self.verbose:
+                    print(file=sys.stderr)
+            next_token = tokens[next_token_idx]
+            next_token_idx += 1
+
+            # Encode the next token
+            token_encoder.encode_symbol(cdf, next_token)
+
+            progress_bar.update()
+
+        progress_bar.close()
         token_encoder.finish()
         compressed = token_encoder.get_encoded()
-
         signal.signal(signal.SIGINT, s)
-
         return compressed
 
-    def tokenizer_adds_space_prefix(self):
-        space = b" "
-        double_space = b"  "
-        tokenized = self.model.tokenize(space, add_bos=False)
-        return self.model.detokenize(tokenized) == double_space
-
     def decompress(self, compressed: bytes, window_overlap=0) -> bytes:
-        def process_logits(_, logits):
+        seen_tokens = []
+        decompressed = bytearray()
+        token_decoder = Decoder(compressed)
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.sep_token_id
+        if eos_token_id is None:
+            eos_token_id = self.tokenizer.convert_tokens_to_ids("[EOS]")
+        if eos_token_id is None:
+            raise ValueError("No EOS token found in tokenizer.")
+
+        done = False
+        max_context_length = self.model.config.max_position_embeddings
+
+        while not done:
+            start_idx = max(0, len(seen_tokens) - window_overlap)
+            context_tokens = seen_tokens[start_idx:]
+            input_ids = [self.tokenizer.bos_token_id] + context_tokens
+            input_ids = torch.tensor([input_ids])
+
+            if input_ids.size(1) >= max_context_length:
+                # Truncate input_ids if necessary
+                input_ids = input_ids[:, -max_context_length:]
+
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids)
+                logits = outputs.logits[0, -1, :]  # get logits for the next token
+
+            # Compute cdf
+            logits = logits.unsqueeze(0)
             cdf = self.compute_cdf(logits)
+
+            # Decode the next token
             next_token = token_decoder.decode_symbol(cdf)
-            logits[next_token] = np.inf
-            if next_token == self.model.token_eos():
-                return logits
-            next_utf8 = self.model.detokenize([next_token])
+
+            if next_token == eos_token_id:
+                done = True
+                break
+
+            # Append the token to seen_tokens
+            seen_tokens.append(next_token)
+
+            # Decode the token to utf-8
+            next_utf8 = self.tokenizer.decode(
+                [next_token], clean_up_tokenization_spaces=False
+            )
+            # Handle tokenizer adds space prefix
             if (
-                len(seen_tokens) == 0
-                and next_utf8.startswith(b" ")
+                len(seen_tokens) == 1
+                and next_utf8.startswith(" ")
                 and self.tokenizer_adds_space_prefix()
             ):
                 next_utf8 = next_utf8[1:]
-            seen_tokens.append(next_token)
-            next_bytes = utf8_to_bytes(utf8_decoder.decode(next_utf8))
+
+            # Convert utf-8 to bytes directly
+            next_bytes = utf8_to_bytes(next_utf8)
             decompressed.extend(next_bytes)
             if self.verbose:
                 sys.stdout.buffer.write(next_bytes)
                 sys.stdout.buffer.flush()
-            return logits
 
-        def should_stop(tokens_so_far, logits):
-            nonlocal done
-            if np.argmax(logits) == self.model.token_eos():
-                done = True
-            return done or len(tokens_so_far) == self.model.n_ctx()
-
-        self.model.reset()
-        seen_tokens = []
-        decompressed = bytearray()
-        token_decoder = Decoder(compressed)
-        utf8_decoder = codecs.getincrementaldecoder("utf-8")()
-        done = False
-        while not done:
-            start_idx = max(0, len(seen_tokens) - window_overlap)
-            consume(
-                self.model.generate(
-                    tokens=[self.model.token_bos()] + seen_tokens[start_idx:],
-                    temp=0.0,
-                    logits_processor=process_logits,
-                    stopping_criteria=should_stop,
-                )
-            )
         return decompressed
 
 
@@ -393,7 +480,7 @@ def make_arg_parser():
     parser = argparse.ArgumentParser(
         description="LLM-powered lossless compression tool"
     )
-    parser.add_argument("model_path", help="path to model file")
+    parser.add_argument("model_path", help="path to model file or model identifier")
     parser.add_argument(
         "-f",
         "--compressed-format",
@@ -424,6 +511,12 @@ def make_arg_parser():
         default=False,
         action="store_true",
         help="use mlock to keep model in RAM (disabled by default)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="enable verbose output during compression/decompression",
     )
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
@@ -471,7 +564,7 @@ def main():
         use_mlock=args.use_mlock,
         n_ctx=args.n_ctx,
         n_gpu_layers=args.n_gpu_layers,
-        verbose=True,
+        verbose=args.verbose,
     )
 
     try:
@@ -479,14 +572,20 @@ def main():
             percent = float(args.overlap[:-1])
             if not (0 <= percent <= 100):
                 parser.error("window overlap must be in the range [0%, 100%]")
-            window_overlap = int(percent / 100 * (compressor.model.n_ctx() - 1))
+            window_overlap = int(
+                percent
+                / 100
+                * (compressor.model.config.max_position_embeddings - 1)
+            )
         else:
             window_overlap = int(args.overlap)
             if window_overlap < 0:
-                window_overlap += compressor.model.n_ctx()
-            if not (0 <= window_overlap < compressor.model.n_ctx()):
+                window_overlap += compressor.model.config.max_position_embeddings
+            if not (
+                0 <= window_overlap < compressor.model.config.max_position_embeddings
+            ):
                 parser.error(
-                    f"window overlap must be in the range [{-compressor.model.n_ctx()}, {compressor.model.n_ctx() - 1}]"
+                    f"window overlap must be in the range [{-compressor.model.config.max_position_embeddings}, {compressor.model.config.max_position_embeddings - 1}]"
                 )
     except ValueError:
         parser.error(
@@ -513,7 +612,10 @@ def main():
             )
             if args.compressed_format == "base64":
                 compressed = robust_b64decode(compressed)
-            compressor.decompress(compressed, window_overlap)
+            decompressed = compressor.decompress(compressed, window_overlap)
+            if not compressor.verbose:
+                sys.stdout.buffer.write(decompressed)
+                sys.stdout.buffer.flush()
         elif args.interactive:
             while True:
                 try:
@@ -527,9 +629,14 @@ def main():
                 if input_bytes and all(byte in BASE64_EQ for byte in input_bytes):
                     try:
                         compressed = robust_b64decode(input_bytes)
-                        compressor.decompress(compressed, window_overlap)
+                        decompressed = compressor.decompress(
+                            compressed, window_overlap
+                        )
                     except KeyboardInterrupt:
                         pass
+                    if not compressor.verbose:
+                        sys.stdout.buffer.write(decompressed)
+                        sys.stdout.buffer.flush()
                 else:
                     compressed = compressor.compress(input_bytes, window_overlap)
                     compressed = base64.b64encode(compressed)
@@ -542,3 +649,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
