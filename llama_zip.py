@@ -1,7 +1,6 @@
 import argparse
 import base64
 import codecs
-import json
 import signal
 import sys
 
@@ -9,11 +8,7 @@ import numpy as np
 import torch
 from more_itertools import consume
 from tqdm import tqdm
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PreTrainedTokenizer,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PUA_START = 0xE000
 
@@ -22,54 +17,8 @@ FREQ_SCALE_FACTOR = 1 << 32
 
 BASE64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 BASE64_EQ = BASE64 + b"="
-class CustomTokenizer(PreTrainedTokenizer):
-    def __init__(self, vocab_file=None, **kwargs):
-        super().__init__(**kwargs)
-        self.vocab = self.get_vocab()
-        self.pad_token = "[PAD]"
-        self.unk_token = "[UNK]"
-        self.eos_token = "[EOS]"
-        self.mask_token = "[MASK]"
-        self.sep_token = "[SEP]"
-        self.bos_token = "[EOS]"  # Set BOS token to EOS
 
-    def _tokenize(self, text):
-        return list(text)  # Tokenize by character
 
-    def _convert_token_to_id(self, token):
-        return self.vocab.get(token, self.vocab[self.unk_token])
-
-    def _convert_id_to_token(self, index):
-        for token, token_id in self.vocab.items():
-            if token_id == index:
-                return token
-        return self.unk_token
-
-    def save_vocabulary(self, save_directory, filename_prefix=None):
-        """Save the tokenizer vocabulary to the specified directory."""
-        vocab_file_path = f"{save_directory}/{filename_prefix or ''}vocab.json"
-        with open(vocab_file_path, "w") as f:
-            json.dump(self.get_vocab(), f)
-        return (vocab_file_path,)
-
-    def get_vocab(self):
-        # Assign indices to special tokens
-        vocab = {
-            "[PAD]": 0,
-            "[UNK]": 1,
-            "[EOS]": 2,
-            "[MASK]": 3,
-            "[SEP]": 4,
-            # Note: We don't define a separate [BOS] token
-            # Since BOS is the same as EOS
-        }
-        # Start character indices after the special tokens
-        start_index = max(vocab.values()) + 1
-        vocab.update({chr(x): idx for idx, x in enumerate(range(32, 127), start=start_index)})
-        return vocab
-
-    def __len__(self):
-        return len(self.vocab)
 class ArithmeticCoderBase:
     def __init__(self):
         full_range = 1 << NUM_STATE_BITS
@@ -302,13 +251,7 @@ class LlamaZip:
         loading_message = "Loading model..."
         if self.verbose:
             print(loading_message, end="", flush=True, file=sys.stderr)
-
-        # Use the CustomTokenizer for the specific model
-        if model_path == "christopherOosthuizen/gpt2-small":
-            self.tokenizer = CustomTokenizer()
-        else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.model = AutoModelForCausalLM.from_pretrained(model_path)
         self.model.eval()
         # Set max context length if specified
@@ -345,8 +288,6 @@ class LlamaZip:
         eos_token_id = self.tokenizer.eos_token_id
         if eos_token_id is None:
             eos_token_id = self.tokenizer.sep_token_id
-        if eos_token_id is None:
-            eos_token_id = self.tokenizer.convert_tokens_to_ids("[EOS]")
         if eos_token_id is None:
             raise ValueError("No EOS token found in tokenizer.")
         tokens.append(eos_token_id)
@@ -419,8 +360,6 @@ class LlamaZip:
         if eos_token_id is None:
             eos_token_id = self.tokenizer.sep_token_id
         if eos_token_id is None:
-            eos_token_id = self.tokenizer.convert_tokens_to_ids("[EOS]")
-        if eos_token_id is None:
             raise ValueError("No EOS token found in tokenizer.")
 
         done = False
@@ -480,7 +419,7 @@ def make_arg_parser():
     parser = argparse.ArgumentParser(
         description="LLM-powered lossless compression tool"
     )
-    parser.add_argument("model_path", help="path to model file or model identifier")
+    parser.add_argument("model_path", help="path to model file")
     parser.add_argument(
         "-f",
         "--compressed-format",
@@ -573,9 +512,7 @@ def main():
             if not (0 <= percent <= 100):
                 parser.error("window overlap must be in the range [0%, 100%]")
             window_overlap = int(
-                percent
-                / 100
-                * (compressor.model.config.max_position_embeddings - 1)
+                percent / 100 * (compressor.model.config.max_position_embeddings - 1)
             )
         else:
             window_overlap = int(args.overlap)
